@@ -6,10 +6,10 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
-const port = Number(process.env.FRAMEFLOW_PROCESSOR_PORT || 8788);
-const ytDlp = process.env.YT_DLP_PATH || "/opt/homebrew/bin/yt-dlp";
-const ffmpeg = process.env.FFMPEG_PATH || "/opt/homebrew/bin/ffmpeg";
-const ffprobe = process.env.FFPROBE_PATH || "/opt/homebrew/bin/ffprobe";
+const port = Number(process.env.PORT || process.env.FRAMEFLOW_PROCESSOR_PORT || 8788);
+const ytDlp = process.env.YT_DLP_PATH || "yt-dlp";
+const ffmpeg = process.env.FFMPEG_PATH || "ffmpeg";
+const ffprobe = process.env.FFPROBE_PATH || "ffprobe";
 
 function json(res, status, payload) {
   res.writeHead(status, {
@@ -40,7 +40,7 @@ async function analyze(sourceUrl) {
 
   try {
     await run(ytDlp, [
-      "--cookies-from-browser", "chrome", "--no-playlist",
+      "--no-playlist",
       "--merge-output-format", "mp4", "--max-filesize", "120M",
       "-o", videoPath, sourceUrl,
     ]);
@@ -109,6 +109,6 @@ createServer(async (req, res) => {
       return json(res, 500, { error: error instanceof Error ? error.message : "视频处理失败" });
     }
   });
-}).listen(port, "127.0.0.1", () => {
-  console.log(`FrameFlow processor ready at http://127.0.0.1:${port}`);
+}).listen(port, "0.0.0.0", () => {
+  console.log(`FrameFlow processor ready on port ${port}`);
 });
