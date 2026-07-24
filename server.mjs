@@ -12,6 +12,9 @@ const port = Number(process.env.PORT || process.env.FRAMEFLOW_PROCESSOR_PORT || 
 const ytDlp = process.env.YT_DLP_PATH || "yt-dlp";
 const ffmpeg = process.env.FFMPEG_PATH || "ffmpeg";
 const ffprobe = process.env.FFPROBE_PATH || "ffprobe";
+const aiApiKey = process.env.AI_API_KEY || "";
+const aiBaseUrl = (process.env.AI_BASE_URL || "https://api.jumengai.net/v1").replace(/\/$/, "");
+const aiModel = process.env.AI_MODEL || "gpt-5.6-luna";
 
 function json(res, status, payload) {
   res.writeHead(status, {
@@ -171,6 +174,65 @@ async function analyzeUpload(req) {
   }
 }
 
+function parseModelJson(content) {
+  const cleaned = String(content || "").replace(/^```json\s*/i, "").replace(/```$/i, "").trim();
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start < 0 || end < start) throw new Error("视觉模型没有返回有效的分析结果");
+  return JSON.parse(cleaned.slice(start, end + 1));
+}
+
+async function analyzeShotWithAI(keyframes, shot) {
+  if (!aiApiKey) throw new Error("视觉模型尚未配置");
+  const images = keyframes.slice(0, 3).map((url) => ({
+    type: "image_url",
+    image_url: { url },
+  }));
+  const prompt = `你是短视频分镜导演。分析这些按时间顺序排列的关键帧。
+镜头时长：${Number(shot?.duration || 0).toFixed(2)} 秒。
+只返回一个 JSON 对象，不要 Markdown。字段必须包含：
+description（中文，一句话准确描述人物、场景、动作）；
+characters（中文字符串，人物数量、外貌、服装；无人则写“无人物”）；
+scene（中文字符串，环境、物品、光线）；
+action（中文字符串，动作及首尾变化）；
+camera（中文字符串，景别、机位、构图、镜头运动）；
+continuity（中文字符串，与前后帧的可衔接性）；
+strategy（只能是 keep、single_frame、multi_frame、ai_remake 之一）；
+frameCount（1 到 3 的整数）；
+reason（中文字符串，推荐该处理方式的理由）；
+prompt（英文，可直接用于生图或生视频，强调人物、服装、场景和构图一致性）。`;
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(`${aiBaseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${aiApiKey}`,
+        },
+        body: JSON.stringify({
+          model: aiModel,
+          messages: [
+            { role: "system", content: "你只输出符合要求的 JSON，不添加解释。" },
+            { role: "user", content: [{ type: "text", text: prompt }, ...images] },
+          ],
+        }),
+        signal: AbortSignal.timeout(45_000),
+      });
+      const payload = await response.json();
+      if (!response.ok || payload.error) {
+        throw new Error(payload.error?.message || `视觉模型请求失败 (${response.status})`);
+      }
+      const result = parseModelJson(payload.choices?.[0]?.message?.content);
+      return { ...result, model: payload.model || aiModel, usage: payload.usage || null };
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 2_000));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("视觉模型暂时不可用");
+}
+
 createServer(async (req, res) => {
   if (req.method === "OPTIONS") return json(res, 204, {});
   if (req.method === "GET" && req.url === "/health") return json(res, 200, { status: "ok" });
@@ -180,6 +242,25 @@ createServer(async (req, res) => {
     } catch (error) {
       return json(res, 500, { error: error instanceof Error ? error.message : "视频处理失败" });
     }
+  }
+  if (req.method === "POST" && req.url === "/analyze-shot") {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 8 * 1024 * 1024) req.destroy(new Error("关键帧数据过大"));
+    });
+    req.on("end", async () => {
+      try {
+        const { keyframes, shot } = JSON.parse(body || "{}");
+        if (!Array.isArray(keyframes) || !keyframes.length || keyframes.some((item) => !String(item).startsWith("data:image/"))) {
+          return json(res, 400, { error: "缺少有效的镜头关键帧" });
+        }
+        return json(res, 200, { analysis: await analyzeShotWithAI(keyframes, shot) });
+      } catch (error) {
+        return json(res, 500, { error: error instanceof Error ? error.message : "视觉识别失败" });
+      }
+    });
+    return;
   }
   if (req.method !== "POST" || req.url !== "/analyze") return json(res, 404, { error: "Not found" });
   let body = "";
