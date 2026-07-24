@@ -16,6 +16,7 @@ function json(res, status, payload) {
     "content-type": "application/json; charset=utf-8",
     "access-control-allow-origin": "*",
     "access-control-allow-headers": "content-type",
+    "access-control-allow-methods": "GET, POST, OPTIONS",
   });
   res.end(JSON.stringify(payload));
 }
