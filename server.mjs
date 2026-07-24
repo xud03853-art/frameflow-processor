@@ -99,18 +99,42 @@ async function analyzeFile(videoPath, workDir, sourceUrl, requestId) {
     for (let index = 0; index < boundaries.length - 1; index += 1) {
       const start = boundaries[index];
       const end = boundaries[index + 1];
-      const framePath = join(workDir, `frame-${index + 1}.jpg`);
-      await run(ffmpeg, [
-        "-hide_banner", "-loglevel", "error", "-ss", (start + (end - start) / 2).toFixed(3),
-        "-i", videoPath, "-frames:v", "1", "-vf", "scale=540:-2", "-q:v", "4", framePath,
-      ]);
-      const image = await readFile(framePath);
+      const shotDuration = end - start;
+      const frameCount = shotDuration >= 4 ? 3 : shotDuration >= 1.5 ? 2 : 1;
+      const strategy = frameCount === 1 ? "single_frame" : "multi_frame";
+      const positions = frameCount === 1
+        ? [start + shotDuration / 2]
+        : frameCount === 2
+          ? [start + shotDuration * 0.2, start + shotDuration * 0.8]
+          : [start + shotDuration * 0.12, start + shotDuration * 0.5, start + shotDuration * 0.88];
+      const keyframes = [];
+      for (let frameIndex = 0; frameIndex < positions.length; frameIndex += 1) {
+        const framePath = join(workDir, `frame-${index + 1}-${frameIndex + 1}.jpg`);
+        await run(ffmpeg, [
+          "-hide_banner", "-loglevel", "error", "-ss", positions[frameIndex].toFixed(3),
+          "-i", videoPath, "-frames:v", "1", "-vf", "scale=420:-2", "-q:v", "5", framePath,
+        ]);
+        const frame = await readFile(framePath);
+        keyframes.push(`data:image/jpeg;base64,${frame.toString("base64")}`);
+      }
+      const image = keyframes[Math.floor(keyframes.length / 2)];
       shots.push({
         id: index + 1,
         title: `镜头 ${String(index + 1).padStart(2, "0")}`,
-        start, end, duration: end - start,
+        start, end, duration: shotDuration,
         description: "自动检测到的独立镜头，可补充画面描述与生成提示词。",
-        image: `data:image/jpeg;base64,${image.toString("base64")}`,
+        image,
+        keyframes,
+        decision: {
+          strategy,
+          frameCount,
+          canConnect: shotDuration >= 1.5,
+          characterConsistency: "需在生成阶段锁定人物参考图与服装特征",
+          reason: frameCount === 1
+            ? "镜头较短，单张关键帧即可保持构图并生成动态。"
+            : `镜头持续 ${shotDuration.toFixed(1)} 秒，建议使用 ${frameCount} 张关键帧衔接动作与构图。`,
+          prompt: `Vertical ${video?.height >= video?.width ? "9:16" : "16:9"} cinematic shot, preserve subject identity, clothing, scene layout and camera angle, coherent motion between ${frameCount} keyframe${frameCount > 1 ? "s" : ""}, natural lighting, high detail.`,
+        },
       });
     }
     console.log(`[${requestId}] analysis finished (${shots.length} shots)`);
