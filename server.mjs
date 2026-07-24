@@ -30,21 +30,30 @@ function allowedUrl(value) {
   }
 }
 
-async function run(file, args) {
-  return exec(file, args, { maxBuffer: 16 * 1024 * 1024 });
+async function run(file, args, timeout = 120_000) {
+  return exec(file, args, {
+    maxBuffer: 16 * 1024 * 1024,
+    timeout,
+    killSignal: "SIGKILL",
+  });
 }
 
 async function analyze(sourceUrl) {
+  const requestId = crypto.randomUUID().slice(0, 8);
   const workDir = await mkdtemp(join(tmpdir(), "frameflow-"));
   const videoPath = join(workDir, "source.mp4");
   const scenePath = join(workDir, "scenes.txt");
 
   try {
+    console.log(`[${requestId}] download started`);
     await run(ytDlp, [
       "--no-playlist",
+      "--socket-timeout", "30",
+      "--retries", "2",
       "--merge-output-format", "mp4", "--max-filesize", "120M",
       "-o", videoPath, sourceUrl,
     ]);
+    console.log(`[${requestId}] download finished`);
     const probe = await run(ffprobe, [
       "-v", "error", "-show_entries",
       "format=duration:stream=codec_type,width,height,r_frame_rate",
@@ -65,7 +74,12 @@ async function analyze(sourceUrl) {
     const sceneText = await readFile(scenePath, "utf8");
     const cuts = [...sceneText.matchAll(/lavfi\.scd\.time=([\d.]+)/g)]
       .map((match) => Number(match[1]))
-      .filter((time) => time > 0.35 && time < duration - 0.35);
+      .filter((time, index, values) =>
+        time > 0.35
+        && time < duration - 0.35
+        && (index === 0 || time - values[index - 1] >= 0.35)
+      )
+      .slice(0, 23);
     const boundaries = [0, ...cuts, duration];
     const shots = [];
 
@@ -86,10 +100,14 @@ async function analyze(sourceUrl) {
         image: `data:image/jpeg;base64,${image.toString("base64")}`,
       });
     }
+    console.log(`[${requestId}] analysis finished (${shots.length} shots)`);
     return {
       sourceUrl, duration, width: video?.width || 0, height: video?.height || 0,
       hasAudio: media.streams.some((stream) => stream.codec_type === "audio"), shots,
     };
+  } catch (error) {
+    console.error(`[${requestId}] analysis failed`, error);
+    throw error;
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
