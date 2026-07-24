@@ -1,8 +1,10 @@
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
+import { createWriteStream } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -15,7 +17,7 @@ function json(res, status, payload) {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "access-control-allow-origin": "*",
-    "access-control-allow-headers": "content-type",
+    "access-control-allow-headers": "content-type, x-file-name",
     "access-control-allow-methods": "GET, POST, OPTIONS",
   });
   res.end(JSON.stringify(payload));
@@ -42,7 +44,6 @@ async function analyze(sourceUrl) {
   const requestId = crypto.randomUUID().slice(0, 8);
   const workDir = await mkdtemp(join(tmpdir(), "frameflow-"));
   const videoPath = join(workDir, "source.mp4");
-  const scenePath = join(workDir, "scenes.txt");
 
   try {
     console.log(`[${requestId}] download started`);
@@ -54,6 +55,18 @@ async function analyze(sourceUrl) {
       "-o", videoPath, sourceUrl,
     ]);
     console.log(`[${requestId}] download finished`);
+    return await analyzeFile(videoPath, workDir, sourceUrl, requestId);
+  } catch (error) {
+    console.error(`[${requestId}] analysis failed`, error);
+    throw error;
+  } finally {
+    await rm(workDir, { recursive: true, force: true });
+  }
+}
+
+async function analyzeFile(videoPath, workDir, sourceUrl, requestId) {
+  const scenePath = join(workDir, "scenes.txt");
+  try {
     const probe = await run(ffprobe, [
       "-v", "error", "-show_entries",
       "format=duration:stream=codec_type,width,height,r_frame_rate",
@@ -108,6 +121,27 @@ async function analyze(sourceUrl) {
   } catch (error) {
     console.error(`[${requestId}] analysis failed`, error);
     throw error;
+  }
+}
+
+async function analyzeUpload(req) {
+  const requestId = crypto.randomUUID().slice(0, 8);
+  const workDir = await mkdtemp(join(tmpdir(), "frameflow-upload-"));
+  const videoPath = join(workDir, "upload.mp4");
+  const declaredSize = Number(req.headers["content-length"] || 0);
+  if (declaredSize > 120 * 1024 * 1024) throw new Error("视频不能超过 120MB");
+
+  let received = 0;
+  req.on("data", (chunk) => {
+    received += chunk.length;
+    if (received > 120 * 1024 * 1024) req.destroy(new Error("视频不能超过 120MB"));
+  });
+  try {
+    console.log(`[${requestId}] upload started`);
+    await pipeline(req, createWriteStream(videoPath));
+    if (!received) throw new Error("请选择要上传的视频");
+    console.log(`[${requestId}] upload finished (${received} bytes)`);
+    return await analyzeFile(videoPath, workDir, "uploaded-video", requestId);
   } finally {
     await rm(workDir, { recursive: true, force: true });
   }
@@ -116,6 +150,13 @@ async function analyze(sourceUrl) {
 createServer(async (req, res) => {
   if (req.method === "OPTIONS") return json(res, 204, {});
   if (req.method === "GET" && req.url === "/health") return json(res, 200, { status: "ok" });
+  if (req.method === "POST" && req.url === "/analyze-upload") {
+    try {
+      return json(res, 200, await analyzeUpload(req));
+    } catch (error) {
+      return json(res, 500, { error: error instanceof Error ? error.message : "视频处理失败" });
+    }
+  }
   if (req.method !== "POST" || req.url !== "/analyze") return json(res, 404, { error: "Not found" });
   let body = "";
   req.on("data", (chunk) => { body += chunk; });
