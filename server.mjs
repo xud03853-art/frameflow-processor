@@ -244,20 +244,27 @@ function dataUrlToBlob(dataUrl) {
   return { blob: new Blob([bytes], { type: match[1] }), type: match[1] };
 }
 
-async function generateImage(prompt, referenceImage) {
+async function generateImage(prompt, referenceImages) {
   if (!imageApiKey) throw new Error("生图模型尚未配置");
+  const references = (Array.isArray(referenceImages) ? referenceImages : [referenceImages])
+    .filter(Boolean)
+    .slice(0, 2);
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
       let endpoint = `${imageBaseUrl}/images/generations`;
       let body;
       let headers;
-      if (referenceImage) {
-        const { blob, type } = dataUrlToBlob(referenceImage);
+      if (references.length) {
         const form = new FormData();
         form.append("model", imageModel);
         form.append("prompt", prompt);
-        form.append("image", blob, type === "image/png" ? "reference.png" : "reference.jpg");
+        references.forEach((reference, index) => {
+          const { blob, type } = dataUrlToBlob(reference);
+          const field = references.length > 1 ? "image[]" : "image";
+          const extension = type === "image/png" ? "png" : type === "image/webp" ? "webp" : "jpg";
+          form.append(field, blob, `reference-${index + 1}.${extension}`);
+        });
         endpoint = `${imageBaseUrl}/images/edits`;
         body = form;
         headers = { authorization: `Bearer ${imageApiKey}` };
@@ -287,7 +294,8 @@ async function generateImage(prompt, referenceImage) {
         image,
         revisedPrompt: item.revised_prompt || prompt,
         model: imageModel,
-        usedReference: Boolean(referenceImage),
+        usedReference: references.length > 0,
+        referenceCount: references.length,
       };
     } catch (error) {
       lastError = error;
@@ -330,13 +338,13 @@ createServer(async (req, res) => {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 12 * 1024 * 1024) req.destroy(new Error("生图数据过大"));
+      if (body.length > 24 * 1024 * 1024) req.destroy(new Error("生图数据过大"));
     });
     req.on("end", async () => {
       try {
-        const { prompt, referenceImage } = JSON.parse(body || "{}");
+        const { prompt, referenceImage, referenceImages } = JSON.parse(body || "{}");
         if (!String(prompt || "").trim()) return json(res, 400, { error: "缺少生图提示词" });
-        return json(res, 200, await generateImage(String(prompt).slice(0, 6000), referenceImage));
+        return json(res, 200, await generateImage(String(prompt).slice(0, 6000), referenceImages || referenceImage));
       } catch (error) {
         return json(res, 500, { error: error instanceof Error ? error.message : "图片生成失败" });
       }
