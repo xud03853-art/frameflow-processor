@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
-import { createWriteStream } from "node:fs";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -18,6 +18,55 @@ const aiModel = process.env.AI_MODEL || "gpt-5.6-luna";
 const imageApiKey = process.env.IMAGE_API_KEY || "";
 const imageBaseUrl = (process.env.IMAGE_BASE_URL || aiBaseUrl).replace(/\/$/, "");
 const imageModel = process.env.IMAGE_MODEL || "gpt-image-2";
+const previewFiles = new Map();
+
+function registerPreview(workDir, videoPath) {
+  if (previewFiles.size >= 6) {
+    const [oldestId, oldest] = previewFiles.entries().next().value;
+    previewFiles.delete(oldestId);
+    void rm(oldest.workDir, { recursive: true, force: true });
+  }
+  const id = crypto.randomUUID();
+  previewFiles.set(id, { path: videoPath, workDir, expiresAt: Date.now() + 60 * 60 * 1000 });
+  setTimeout(async () => {
+    previewFiles.delete(id);
+    await rm(workDir, { recursive: true, force: true });
+  }, 60 * 60 * 1000).unref();
+  return `/preview/${id}`;
+}
+
+async function servePreview(req, res, id) {
+  const preview = previewFiles.get(id);
+  if (!preview || preview.expiresAt < Date.now()) {
+    previewFiles.delete(id);
+    return json(res, 404, { error: "视频预览已过期，请重新分析" });
+  }
+  const info = await stat(preview.path);
+  const range = String(req.headers.range || "");
+  const commonHeaders = {
+    "content-type": "video/mp4",
+    "accept-ranges": "bytes",
+    "access-control-allow-origin": "*",
+    "cache-control": "private, no-store",
+  };
+  if (range.startsWith("bytes=")) {
+    const [rawStart, rawEnd] = range.slice(6).split("-");
+    const start = Math.max(0, Number(rawStart) || 0);
+    const end = Math.min(info.size - 1, Number(rawEnd) || info.size - 1);
+    if (start > end) {
+      res.writeHead(416, { ...commonHeaders, "content-range": `bytes */${info.size}` });
+      return res.end();
+    }
+    res.writeHead(206, {
+      ...commonHeaders,
+      "content-length": end - start + 1,
+      "content-range": `bytes ${start}-${end}/${info.size}`,
+    });
+    return createReadStream(preview.path, { start, end }).pipe(res);
+  }
+  res.writeHead(200, { ...commonHeaders, "content-length": info.size });
+  return createReadStream(preview.path).pipe(res);
+}
 
 function json(res, status, payload) {
   res.writeHead(status, {
@@ -50,6 +99,7 @@ async function analyze(sourceUrl) {
   const requestId = crypto.randomUUID().slice(0, 8);
   const workDir = await mkdtemp(join(tmpdir(), "frameflow-"));
   const videoPath = join(workDir, "source.mp4");
+  let retained = false;
 
   try {
     console.log(`[${requestId}] download started`);
@@ -61,12 +111,15 @@ async function analyze(sourceUrl) {
       "-o", videoPath, sourceUrl,
     ]);
     console.log(`[${requestId}] download finished`);
-    return await analyzeFile(videoPath, workDir, sourceUrl, requestId);
+    const result = await analyzeFile(videoPath, workDir, sourceUrl, requestId);
+    const previewUrl = registerPreview(workDir, videoPath);
+    retained = true;
+    return { ...result, previewUrl };
   } catch (error) {
     console.error(`[${requestId}] analysis failed`, error);
     throw error;
   } finally {
-    await rm(workDir, { recursive: true, force: true });
+    if (!retained) await rm(workDir, { recursive: true, force: true });
   }
 }
 
@@ -158,6 +211,7 @@ async function analyzeUpload(req) {
   const requestId = crypto.randomUUID().slice(0, 8);
   const workDir = await mkdtemp(join(tmpdir(), "frameflow-upload-"));
   const videoPath = join(workDir, "upload.mp4");
+  let retained = false;
   const declaredSize = Number(req.headers["content-length"] || 0);
   if (declaredSize > 120 * 1024 * 1024) throw new Error("视频不能超过 120MB");
 
@@ -171,9 +225,12 @@ async function analyzeUpload(req) {
     await pipeline(req, createWriteStream(videoPath));
     if (!received) throw new Error("请选择要上传的视频");
     console.log(`[${requestId}] upload finished (${received} bytes)`);
-    return await analyzeFile(videoPath, workDir, "uploaded-video", requestId);
+    const result = await analyzeFile(videoPath, workDir, "uploaded-video", requestId);
+    const previewUrl = registerPreview(workDir, videoPath);
+    retained = true;
+    return { ...result, previewUrl };
   } finally {
-    await rm(workDir, { recursive: true, force: true });
+    if (!retained) await rm(workDir, { recursive: true, force: true });
   }
 }
 
@@ -386,6 +443,13 @@ async function generateImage(prompt, referenceImages) {
 
 createServer(async (req, res) => {
   if (req.method === "OPTIONS") return json(res, 204, {});
+  if (req.method === "GET" && req.url?.startsWith("/preview/")) {
+    try {
+      return await servePreview(req, res, req.url.slice("/preview/".length).split("?")[0]);
+    } catch (error) {
+      return json(res, 500, { error: error instanceof Error ? error.message : "视频预览失败" });
+    }
+  }
   if (req.method === "GET" && req.url === "/health") return json(res, 200, { status: "ok" });
   if (req.method === "POST" && req.url === "/analyze-upload") {
     try {
