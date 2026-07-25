@@ -236,18 +236,42 @@ prompt（英文，可直接用于生图或生视频，强调人物、服装、�
   throw lastError instanceof Error ? lastError : new Error("视觉模型暂时不可用");
 }
 
-async function generateImage(prompt) {
+function dataUrlToBlob(dataUrl) {
+  const match = String(dataUrl || "").match(/^data:(image\/[\w.+-]+);base64,(.+)$/s);
+  if (!match) throw new Error("参考图格式无效");
+  const bytes = Buffer.from(match[2], "base64");
+  if (bytes.length > 8 * 1024 * 1024) throw new Error("参考图不能超过 8MB");
+  return { blob: new Blob([bytes], { type: match[1] }), type: match[1] };
+}
+
+async function generateImage(prompt, referenceImage) {
   if (!imageApiKey) throw new Error("生图模型尚未配置");
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      const response = await fetch(`${imageBaseUrl}/images/generations`, {
-        method: "POST",
-        headers: {
+      let endpoint = `${imageBaseUrl}/images/generations`;
+      let body;
+      let headers;
+      if (referenceImage) {
+        const { blob, type } = dataUrlToBlob(referenceImage);
+        const form = new FormData();
+        form.append("model", imageModel);
+        form.append("prompt", prompt);
+        form.append("image", blob, type === "image/png" ? "reference.png" : "reference.jpg");
+        endpoint = `${imageBaseUrl}/images/edits`;
+        body = form;
+        headers = { authorization: `Bearer ${imageApiKey}` };
+      } else {
+        body = JSON.stringify({ model: imageModel, prompt, n: 1 });
+        headers = {
           "content-type": "application/json",
           authorization: `Bearer ${imageApiKey}`,
-        },
-        body: JSON.stringify({ model: imageModel, prompt, n: 1 }),
+        };
+      }
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body,
         signal: AbortSignal.timeout(180_000),
       });
       const payload = await response.json();
@@ -263,6 +287,7 @@ async function generateImage(prompt) {
         image,
         revisedPrompt: item.revised_prompt || prompt,
         model: imageModel,
+        usedReference: Boolean(referenceImage),
       };
     } catch (error) {
       lastError = error;
@@ -305,13 +330,13 @@ createServer(async (req, res) => {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 256 * 1024) req.destroy(new Error("提示词数据过大"));
+      if (body.length > 12 * 1024 * 1024) req.destroy(new Error("生图数据过大"));
     });
     req.on("end", async () => {
       try {
-        const { prompt } = JSON.parse(body || "{}");
+        const { prompt, referenceImage } = JSON.parse(body || "{}");
         if (!String(prompt || "").trim()) return json(res, 400, { error: "缺少生图提示词" });
-        return json(res, 200, await generateImage(String(prompt).slice(0, 6000)));
+        return json(res, 200, await generateImage(String(prompt).slice(0, 6000), referenceImage));
       } catch (error) {
         return json(res, 500, { error: error instanceof Error ? error.message : "图片生成失败" });
       }
