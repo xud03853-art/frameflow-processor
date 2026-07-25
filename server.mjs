@@ -236,6 +236,71 @@ prompt（英文，可直接用于生图或生视频，强调人物、服装、�
   throw lastError instanceof Error ? lastError : new Error("视觉模型暂时不可用");
 }
 
+async function planCarpetWithAI(shots, strategy) {
+  if (!aiApiKey) throw new Error("视觉模型尚未配置");
+  const strategyGuide = {
+    natural: "自然植入：只在非常合理的镜头加入地毯，广告感弱，通常约 25%–35% 的镜头。",
+    balanced: "平衡展示：兼顾叙事与产品曝光，通常约 40%–60% 的镜头，避免连续重复展示。",
+    strong: "强产品展示：增加完整外观和纹理特写，但仍保留必要的过渡镜头，通常约 65%–80% 的镜头。",
+  }[strategy] || "平衡展示";
+  const content = [
+    {
+      type: "text",
+      text: `你是地毯短视频广告导演。以下图片按镜头编号排列，参考视频中可能完全没有地毯。
+你的任务不是给所有镜头加地毯，而是判断哪些镜头适合自然植入、重点展示或不植入。
+整体策略：${strategyGuide}
+必须保留原视频的镜头数量、顺序、节奏和每镜头时长，只规划画面内容。
+只返回 JSON：{"plans":[...]}。plans 必须覆盖全部镜头，每项字段：
+id（镜头编号）；
+useCarpet（布尔值）；
+type（只能是 none、natural、hero）；
+placement（中文，说明地毯放在哪里或“不出现地毯”）；
+reason（中文，结合地面可见度、景别、动作和叙事节奏说明原因）；
+imagePrompt（英文，供生成后续图生视频关键帧使用；none 时明确 no carpet）。`,
+    },
+  ];
+  shots.slice(0, 24).forEach((shot) => {
+    content.push({ type: "text", text: `镜头 ${shot.id}，时长 ${Number(shot.duration || 0).toFixed(2)} 秒` });
+    content.push({ type: "image_url", image_url: { url: shot.image } });
+  });
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const response = await fetch(`${aiBaseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${aiApiKey}`,
+        },
+        body: JSON.stringify({
+          model: aiModel,
+          messages: [
+            { role: "system", content: "你是专业广告导演，只输出符合要求的 JSON。" },
+            { role: "user", content },
+          ],
+        }),
+        signal: AbortSignal.timeout(90_000),
+      });
+      const payload = await response.json();
+      if (!response.ok || payload.error) throw new Error(payload.error?.message || `植入规划失败 (${response.status})`);
+      const result = parseModelJson(payload.choices?.[0]?.message?.content);
+      if (!Array.isArray(result.plans)) throw new Error("视觉模型没有返回镜头植入方案");
+      return result.plans.map((plan) => ({
+        id: Number(plan.id),
+        useCarpet: Boolean(plan.useCarpet) && plan.type !== "none",
+        type: ["none", "natural", "hero"].includes(plan.type) ? plan.type : "none",
+        placement: String(plan.placement || "未说明"),
+        reason: String(plan.reason || "未说明"),
+        imagePrompt: String(plan.imagePrompt || ""),
+      }));
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 2_000));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("地毯植入规划暂时不可用");
+}
+
 function dataUrlToBlob(dataUrl) {
   const match = String(dataUrl || "").match(/^data:(image\/[\w.+-]+);base64,(.+)$/s);
   if (!match) throw new Error("参考图格式无效");
@@ -330,6 +395,25 @@ createServer(async (req, res) => {
         return json(res, 200, { analysis: await analyzeShotWithAI(keyframes, shot) });
       } catch (error) {
         return json(res, 500, { error: error instanceof Error ? error.message : "视觉识别失败" });
+      }
+    });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/plan-carpet") {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 16 * 1024 * 1024) req.destroy(new Error("镜头规划数据过大"));
+    });
+    req.on("end", async () => {
+      try {
+        const { shots, strategy } = JSON.parse(body || "{}");
+        if (!Array.isArray(shots) || !shots.length || shots.some((shot) => !String(shot.image || "").startsWith("data:image/") && !String(shot.image || "").startsWith("https://"))) {
+          return json(res, 400, { error: "缺少有效的镜头画面" });
+        }
+        return json(res, 200, { plans: await planCarpetWithAI(shots, strategy) });
+      } catch (error) {
+        return json(res, 500, { error: error instanceof Error ? error.message : "地毯植入规划失败" });
       }
     });
     return;
