@@ -108,6 +108,7 @@ async function createVideoTask(req) {
           role: "first_frame",
         },
       ],
+      generate_audio: false,
       return_last_frame: false,
     }),
     signal: AbortSignal.timeout(30_000),
