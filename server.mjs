@@ -18,7 +18,11 @@ const aiModel = process.env.AI_MODEL || "gpt-5.6-luna";
 const imageApiKey = process.env.IMAGE_API_KEY || "";
 const imageBaseUrl = (process.env.IMAGE_BASE_URL || aiBaseUrl).replace(/\/$/, "");
 const imageModel = process.env.IMAGE_MODEL || "gpt-image-2";
+const videoApiKey = process.env.VIDEO_API_KEY || "";
+const videoBaseUrl = (process.env.VIDEO_BASE_URL || "https://ark.cn-beijing.volces.com/api/v3").replace(/\/$/, "");
+const videoModel = process.env.VIDEO_MODEL || "doubao-seedance-2-0-fast-260128";
 const previewFiles = new Map();
+const videoTasks = new Map();
 
 function registerPreview(workDir, videoPath) {
   if (previewFiles.size >= 6) {
@@ -66,6 +70,119 @@ async function servePreview(req, res, id) {
   }
   res.writeHead(200, { ...commonHeaders, "content-length": info.size });
   return createReadStream(preview.path).pipe(res);
+}
+
+async function readJsonBody(req, limit = 24 * 1024 * 1024) {
+  let body = "";
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > limit) throw new Error("请求内容过大");
+  }
+  return JSON.parse(body || "{}");
+}
+
+async function createVideoTask(req) {
+  if (!videoApiKey) throw new Error("Seedance 尚未配置");
+  const { image, prompt, duration } = await readJsonBody(req);
+  if (!String(image || "").startsWith("http") && !String(image || "").startsWith("data:image/")) {
+    throw new Error("请先生成并确认镜头图片");
+  }
+  const targetDuration = Math.max(0.5, Math.min(15, Number(duration) || 5));
+  const generationDuration = Math.max(5, Math.ceil(targetDuration));
+  const response = await fetch(`${videoBaseUrl}/contents/generations/tasks`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${videoApiKey}`,
+    },
+    body: JSON.stringify({
+      model: videoModel,
+      content: [
+        {
+          type: "text",
+          text: `${String(prompt || "Subtle natural subject motion and a gentle cinematic camera move.").trim()} Keep the confirmed first frame's product, pattern, colors, room layout and subject identity unchanged. No scene cut, no new objects. --ratio adaptive --dur ${generationDuration} --resolution 720p`,
+        },
+        {
+          type: "image_url",
+          image_url: { url: image },
+          role: "first_frame",
+        },
+      ],
+      return_last_frame: false,
+    }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  const payload = await response.json();
+  if (!response.ok || payload.error) {
+    throw new Error(payload.error?.message || `Seedance 任务提交失败 (${response.status})`);
+  }
+  videoTasks.set(payload.id, { targetDuration, previewUrl: null, processing: null });
+  return {
+    taskId: payload.id,
+    status: "queued",
+    model: videoModel,
+    targetDuration,
+    generationDuration,
+  };
+}
+
+async function trimGeneratedVideo(taskId, sourceUrl, targetDuration) {
+  const task = videoTasks.get(taskId);
+  if (task?.previewUrl) return task.previewUrl;
+  if (task?.processing) return task.processing;
+  const processing = (async () => {
+    const workDir = await mkdtemp(join(tmpdir(), "frameflow-generated-"));
+    const sourcePath = join(workDir, "seedance.mp4");
+    const outputPath = join(workDir, "shot.mp4");
+    try {
+      const response = await fetch(sourceUrl, { signal: AbortSignal.timeout(120_000) });
+      if (!response.ok || !response.body) throw new Error("Seedance 视频下载失败");
+      await pipeline(response.body, createWriteStream(sourcePath));
+      await run(ffmpeg, [
+        "-hide_banner", "-loglevel", "error", "-i", sourcePath,
+        "-t", targetDuration.toFixed(3),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-movflags", "+faststart", "-y", outputPath,
+      ], 180_000);
+      const previewUrl = registerPreview(workDir, outputPath);
+      videoTasks.set(taskId, { ...videoTasks.get(taskId), previewUrl, processing: null });
+      return previewUrl;
+    } catch (error) {
+      await rm(workDir, { recursive: true, force: true });
+      throw error;
+    }
+  })();
+  videoTasks.set(taskId, { ...task, processing });
+  return processing;
+}
+
+async function getVideoTask(taskId) {
+  if (!videoApiKey) throw new Error("Seedance 尚未配置");
+  const response = await fetch(`${videoBaseUrl}/contents/generations/tasks/${encodeURIComponent(taskId)}`, {
+    headers: { authorization: `Bearer ${videoApiKey}` },
+    signal: AbortSignal.timeout(30_000),
+  });
+  const payload = await response.json();
+  if (!response.ok || payload.error) {
+    throw new Error(payload.error?.message || `Seedance 状态查询失败 (${response.status})`);
+  }
+  if (payload.status !== "succeeded") {
+    return { taskId, status: payload.status, error: payload.error?.message || null };
+  }
+  const sourceUrl = payload.content?.video_url
+    || payload.content?.video?.url
+    || payload.content?.[0]?.video_url
+    || payload.output?.video_url;
+  if (!sourceUrl) throw new Error("Seedance 已完成，但没有返回视频地址");
+  const targetDuration = videoTasks.get(taskId)?.targetDuration || Number(payload.duration) || 5;
+  const previewUrl = await trimGeneratedVideo(taskId, sourceUrl, targetDuration);
+  return {
+    taskId,
+    status: "succeeded",
+    previewUrl,
+    duration: targetDuration,
+    model: payload.model || videoModel,
+  };
 }
 
 function json(res, status, payload) {
@@ -451,6 +568,20 @@ createServer(async (req, res) => {
     }
   }
   if (req.method === "GET" && req.url === "/health") return json(res, 200, { status: "ok" });
+  if (req.method === "POST" && req.url === "/generate-video") {
+    try {
+      return json(res, 200, await createVideoTask(req));
+    } catch (error) {
+      return json(res, 500, { error: error instanceof Error ? error.message : "视频生成失败" });
+    }
+  }
+  if (req.method === "GET" && req.url?.startsWith("/video-task/")) {
+    try {
+      return json(res, 200, await getVideoTask(req.url.slice("/video-task/".length).split("?")[0]));
+    } catch (error) {
+      return json(res, 500, { error: error instanceof Error ? error.message : "视频状态查询失败" });
+    }
+  }
   if (req.method === "POST" && req.url === "/analyze-upload") {
     try {
       return json(res, 200, await analyzeUpload(req));
